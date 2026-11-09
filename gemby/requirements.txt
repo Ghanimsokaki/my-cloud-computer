@@ -1,0 +1,8 @@
+# Gemby agent runtime.
+# CPU-only or CUDA: if you need a specific CUDA build, install torch first from
+# https://pytorch.org/get-started/locally/ then run: pip install -r requirements.txt
+torch>=2.4
+transformers>=4.44
+safetensors>=0.4
+huggingface_hub>=0.23
+accelerate>=0.33
