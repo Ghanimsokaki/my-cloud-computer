@@ -1,8 +1,13 @@
 # Gemby agent runtime.
-# CPU-only or CUDA: if you need a specific CUDA build, install torch first from
-# https://pytorch.org/get-started/locally/ then run: pip install -r requirements.txt
+#
+# CPU-only machine (e.g. Codespaces has no GPU): install the smaller CPU wheel
+# first, then the rest.
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+#
+# With a CUDA GPU just run `pip install -r requirements.txt` (pulls the CUDA build).
 torch>=2.4
 transformers>=4.44
 safetensors>=0.4
 huggingface_hub>=0.23
-accelerate>=0.33

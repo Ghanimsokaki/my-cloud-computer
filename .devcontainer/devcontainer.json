@@ -1,5 +1,5 @@
 {
-  "name": "High Performance Cloud Computer (Linux)",
+  "name": "High Performance Cloud Computer (Linux) + Gemby agent",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
@@ -9,7 +9,10 @@
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {},
     "ghcr.io/devcontainers/features/git:1": {},
-    "ghcr.io/devcontainers/features/ssh:1": {}
+    "ghcr.io/devcontainers/features/ssh:1": {},
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12"
+    }
   },
   "customizations": {
     "vscode": {
@@ -22,7 +25,10 @@
     }
   },
   "remoteUser": "codespace",
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential git",
+  "remoteEnv": {
+    "PATH": "/home/codespace/.local/bin:${containerEnv:PATH}"
+  },
+  "postCreateCommand": "bash -lc 'cd /workspaces/my-cloud-computer && python3 -m pip install --user torch --index-url https://download.pytorch.org/whl/cpu && python3 -m pip install --user -r gemby/requirements.txt && mkdir -p ~/.local/bin && ln -sf /workspaces/my-cloud-computer/gemby/gemby.py ~/.local/bin/gemby && chmod +x /workspaces/my-cloud-computer/gemby/gemby.py'",
   "mounts": [
     "source=/tmp/cache,target=/tmp/cache,type=bind,consistency=cached"
   ],
@@ -30,7 +36,12 @@
     "MAKEFLAGS": "-j$(nproc)",
     "CCACHE_DIR": "/tmp/cache/.ccache"
   },
-  "forwardPorts": [8080, 3000, 5000],
+  "forwardPorts": [8080, 3000, 5000, 8000],
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "64gb"
+  },
   "runArgs": [
     "--init",
     "--cap-add=SYS_PTRACE",

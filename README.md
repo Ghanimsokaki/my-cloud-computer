@@ -45,5 +45,45 @@ For Windows target builds or Windows-based runners:
 - **Disk**: CCACHE stored in `/tmp/cache` (mounted with `cached` consistency).
 - **Network**: High buffer sizes for fast downloads/uploads.
 
+## 🤖 Gemby agent (Hugging Face)
+
+This repo ships a CLI that loads the Hugging Face model `Hwiiiiiiii/Gemby-2-agent`
+(a gated, Llama-style agent model) and can serve it as an OpenAI-compatible API.
+
+### 1. Give it a Hugging Face token
+The model is **gated**. Accept its license at
+<https://huggingface.co/Hwiiiiiiii/Gemby-2-agent>, then either:
+- add a **Codespaces secret** named `HF_TOKEN`
+  (repo *Settings → Secrets and variables → Codespaces*), **or**
+- `cp .env.example .env` and put your token in `.env` (git-ignored), **or**
+- `export HF_TOKEN=hf_...`
+
+### 2. Create an API key
+```bash
+gemby key new            # printed once; stored hashed in ~/.gemby/keys.json
+gemby key list           # revoke with: gemby key revoke <prefix>
+```
+
+### 3. Run the agent
+```bash
+gemby pull               # download + cache the model (~12.7 GB)
+gemby chat               # interactive chat
+gemby serve --port 8000  # OpenAI-compatible API (Bearer auth required)
+```
+
+Call the API:
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer <your gemby key>" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+```
+
+### Resources
+A 3.19B-parameter model needs real RAM and disk. `.devcontainer/devcontainer.json`
+requests a Codespaces machine with **4 CPUs / 16 GB RAM / 64 GB storage** via
+`hostRequirements`. Choose at least that size when creating the Codespace.
+
 ---
+
 *Created for high-performance cloud computing in Codespaces.*

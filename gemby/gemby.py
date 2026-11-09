@@ -6,25 +6,32 @@ serve it as an OpenAI-compatible API, and manage API keys.
 
 Quick start
 -----------
-    # 1. Create an API key (printed once, stored hashed in ~/.gemby/keys.json)
+    # 1. Provide a Hugging Face token (the model is gated). Either:
+    #      - add a Codespaces secret named HF_TOKEN, or
+    #      - put HF_TOKEN=hf_xxx in .env (git-ignored), or
+    #      - export HF_TOKEN=hf_xxx
+    # 2. Create an API key (printed once, stored hashed in ~/.gemby/keys.json)
     gemby key new
-
-    # 2. Log in to Hugging Face so the gated model can be downloaded
-    huggingface-cli login            # or: export HF_TOKEN=hf_xxx
-
     # 3. Download / cache the model
     gemby pull
-
     # 4. Talk to it
     gemby chat                       # interactive
     gemby serve --port 8000          # OpenAI-compatible server
 
+About the model
+---------------
+`Hwiiiiiiii/Gemby-2-agent` is a Llama-style decoder built from scratch with a
+custom `"model_type": "gemby"` and non-standard weight names, so upstream
+`AutoModelForCausalLM` cannot load it. This CLI remaps the custom weights onto a
+standard Llama architecture (`embed_tokens`, `layers.*.attention.*`, `norm1/2`)
+and builds the chat prompt from the model's own special tokens
+(`<|system|>`, `<|user|>`, `<|assistant|>`).
+
 Environment
 -----------
-    GEMBY_MODEL        model repo id         (default: Hwiiiiiiii/Gemby-2-agent)
-    GEMBY_BASE_MODEL   optional architecture donor when config.json is custom
-    HF_TOKEN           Hugging Face token for the gated model
-    GEMBY_HOME         state dir             (default: ~/.gemby)
+    GEMBY_MODEL   model repo id (default: Hwiiiiiiii/Gemby-2-agent)
+    HF_TOKEN      Hugging Face token for the gated model
+    GEMBY_HOME    state dir (default: ~/.gemby)
 """
 
 from __future__ import annotations
@@ -41,9 +48,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_MODEL = "Hwiiiiiiii/Gemby-2-agent"
+KEY_PREFIX = "gemby-"
+
+
+# --------------------------------------------------------------------------- #
+# .env loading (no external dependency)
+# --------------------------------------------------------------------------- #
+def _load_dotenv() -> None:
+    for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"):
+        if not candidate.is_file():
+            continue
+        for line in candidate.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+_load_dotenv()
+
 GEMBY_HOME = Path(os.environ.get("GEMBY_HOME", Path.home() / ".gemby"))
 KEYS_FILE = GEMBY_HOME / "keys.json"
-KEY_PREFIX = "gemby-"
+
+# Assets we actually need (skips the multi-GB *.jsonl training dumps).
+MODEL_FILES = ["config.json", "tokenizer.json", "model.safetensors"]
+
+# Special tokens used by the Gemby tokenizer.
+ROLE_TOKENS = {"system": "<|system|>", "user": "<|user|>", "assistant": "<|assistant|>"}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +104,6 @@ def _hash(key: str) -> str:
 
 
 def key_new(name: str | None = None) -> str:
-    """Generate, store and return a new API key."""
     raw = KEY_PREFIX + secrets.token_urlsafe(32)
     data = _load_keys()
     data["keys"].append(
@@ -105,7 +136,6 @@ def key_revoke(key_or_prefix: str) -> int:
 
 
 def key_verify(key: str) -> bool:
-    """Return True if `key` matches a stored, non-revoked key."""
     if not key:
         return False
     digest = _hash(key)
@@ -121,95 +151,153 @@ def key_verify(key: str) -> bool:
 # Model loading
 # --------------------------------------------------------------------------- #
 def _hf_token() -> str | None:
-    return (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or None
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+
+def _need_deps(exc: ImportError):
+    raise SystemExit(
+        f"[gemby] missing dependency '{exc.name}'. Install the runtime with:\n"
+        "        pip install -r requirements.txt"
+    ) from exc
+
+
+def _download_assets(model_id: str) -> Path:
+    """Download config/tokenizer/weights into the HF cache; return the dir."""
+    if not _hf_token():
+        raise SystemExit(
+            "[gemby] HF_TOKEN is not set. This model is gated: accept its license at\n"
+            f"        https://huggingface.co/{model_id}\n"
+            "        then add a Codespaces secret named HF_TOKEN, or put it in .env."
+        )
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        _need_deps(exc)
+    for filename in MODEL_FILES:
+        hf_hub_download(model_id, filename, token=_hf_token())
+    return Path(hf_hub_download(model_id, "config.json", token=_hf_token())).parent
+
+
+def _remap_state_dict(state: dict) -> dict:
+    """Map Gemby's custom tensor names onto standard Llama names."""
+    out = {}
+    for name, tensor in state.items():
+        if name == "embed_tokens.weight":
+            new = "model.embed_tokens.weight"
+        elif name == "norm.weight":
+            new = "model.norm.weight"
+        elif name.startswith("layers."):
+            new = ("model." + name
+                   .replace(".attention.", ".self_attn.")
+                   .replace(".norm1.", ".input_layernorm.")
+                   .replace(".norm2.", ".post_attention_layernorm."))
+        else:
+            new = name
+        out[new] = tensor
+    return out
+
+
+def _build_llama_config(cfg: dict):
+    from transformers import LlamaConfig
+
+    return LlamaConfig(
+        vocab_size=cfg["vocab_size"],
+        hidden_size=cfg["hidden_size"],
+        intermediate_size=cfg["intermediate_size"],
+        num_hidden_layers=cfg["num_hidden_layers"],
+        num_attention_heads=cfg["num_attention_heads"],
+        num_key_value_heads=cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
+        max_position_embeddings=cfg.get("max_position_embeddings", 4096),
+        rms_norm_eps=cfg.get("rms_norm_eps", 1e-5),
+        tie_word_embeddings=cfg.get("tie_word_embeddings", True),
+        bos_token_id=cfg.get("bos_token_id"),
+        eos_token_id=cfg.get("eos_token_id"),
+        pad_token_id=cfg.get("pad_token_id"),
+        attention_bias=False,
+        mlp_bias=False,
     )
 
 
-class GembyRuntime:
-    """Holds a loaded model + tokenizer and exposes generate()."""
+def _load_gemby(model_id: str, dtype_name: str, device: str):
+    """Build a Llama model and load Gemby's custom-named weights into it."""
+    import torch
+    from safetensors.torch import load_file
+    from transformers import LlamaForCausalLM
 
-    def __init__(self, model, tokenizer, device: str):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
+    try:
+        from transformers import AutoConfig, PreTrainedTokenizerFast
+    except ImportError as exc:
+        _need_deps(exc)
 
-    # -- prompt building ---------------------------------------------------- #
-    def _build_inputs(self, messages: list[dict]):
-        import torch
+    local_dir = _download_assets(model_id)
+    cfg = json.loads((local_dir / "config.json").read_text())
+    torch_dtype = _resolve_dtype(dtype_name, device)
 
-        tok = self.tokenizer
-        text = None
-        if getattr(tok, "chat_template", None):
-            try:
-                text = tok.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                text = None
-        if text is None:  # repo has no tokenizer_config -> no chat template
-            lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
-            lines.append("assistant:")
-            text = "\n".join(lines)
-        return tok(text, return_tensors="pt").to(self.device)
+    print(f"[gemby] building Llama architecture ({cfg['num_hidden_layers']} layers, "
+          f"{cfg['hidden_size']} hidden) from custom config", file=sys.stderr)
+    llama_cfg = _build_llama_config(cfg)
+    try:
+        model = LlamaForCausalLM._from_config(llama_cfg, torch_dtype=torch_dtype)
+    except TypeError:
+        try:
+            model = LlamaForCausalLM._from_config(llama_cfg, dtype=torch_dtype)
+        except TypeError:
+            model = LlamaForCausalLM(llama_cfg)
+    if next(model.parameters()).dtype != torch_dtype:
+        model = model.to(torch_dtype)
 
-    # -- generation --------------------------------------------------------- #
-    def generate(
-        self,
-        messages: list[dict],
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-    ) -> str:
-        import torch
+    state = _remap_state_dict(load_file(str(local_dir / "model.safetensors")))
+    if llama_cfg.tie_word_embeddings and "lm_head.weight" not in state:
+        state["lm_head.weight"] = state["model.embed_tokens.weight"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected:
+        raise SystemExit(f"[gemby] unexpected weight keys: {unexpected[:5]}")
+    real_missing = [m for m in missing if "lm_head" not in m and "rotary" not in m]
+    if real_missing:
+        print(f"[gemby] warning: {len(real_missing)} missing weights "
+              f"(e.g. {real_missing[:3]})", file=sys.stderr)
 
-        inputs = self._build_inputs(messages)
-        do_sample = temperature is not None and temperature > 0
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-        )
-        if do_sample:
-            gen_kwargs.update(temperature=temperature, top_p=top_p)
-        with torch.no_grad():
-            out = self.model.generate(**inputs, **gen_kwargs)
-        new_tokens = out[0][inputs["input_ids"].shape[-1]:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(local_dir / "tokenizer.json"),
+        bos_token="<|bos|>",
+        eos_token="<|eos|>",
+        unk_token="<|unk|>",
+        pad_token="<|pad|>",
+    )
+    model.eval()
+    if device == "cuda":
+        model = model.to("cuda")
+    return GembyRuntime(model, tokenizer, device, prompt_fn=_gemby_prompt)
 
-    def stream(
-        self,
-        messages: list[dict],
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-    ):
-        """Yield generated text chunks (requires transformers TextIteratorStreamer)."""
-        import torch
-        from transformers import TextIteratorStreamer
 
-        inputs = self._build_inputs(messages)
-        streamer = TextIteratorStreamer(
-            self.tokenizer, skip_prompt=True, skip_special_tokens=True
-        )
-        do_sample = temperature is not None and temperature > 0
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            streamer=streamer,
-        )
-        if do_sample:
-            gen_kwargs.update(temperature=temperature, top_p=top_p)
-        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
-        thread.start()
-        for chunk in streamer:
-            if chunk:
-                yield chunk
-        thread.join()
+def _load_generic(model_id: str, dtype_name: str, device: str, trust_remote_code: bool):
+    """Fallback: standard HF load for any non-custom model type."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    token = _hf_token()
+    torch_dtype = _resolve_dtype(dtype_name, device)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, token=token, trust_remote_code=trust_remote_code
+    )
+    kwargs = dict(token=token, trust_remote_code=trust_remote_code,
+                  low_cpu_mem_usage=True,
+                  device_map=device if device == "cpu" else "auto")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype, **kwargs)
+    except TypeError:  # newer transformers renamed torch_dtype -> dtype
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype, **kwargs)
+    model.eval()
+    return GembyRuntime(model, tokenizer, device, prompt_fn=None)
+
+
+def _gemby_prompt(messages: list[dict]) -> str:
+    parts = []
+    for m in messages:
+        tag = ROLE_TOKENS.get(m.get("role", "user"), ROLE_TOKENS["user"])
+        parts.append(f"{tag}{m.get('content', '')}")
+    parts.append(ROLE_TOKENS["assistant"])
+    return "".join(parts)
 
 
 def _resolve_dtype(dtype: str, device: str):
@@ -219,141 +307,122 @@ def _resolve_dtype(dtype: str, device: str):
         if device.startswith("cuda"):
             return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         return torch.float32
-    return {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }[dtype]
+    return {"float32": torch.float32, "float16": torch.float16,
+            "bfloat16": torch.bfloat16}[dtype]
 
 
-def load_runtime(
-    model_id: str,
-    base_model: str | None = None,
-    dtype: str = "auto",
-    device: str | None = None,
-    trust_remote_code: bool = True,
-) -> GembyRuntime:
-    """Download (if needed) and load the model. Handles the custom `gemby`
-    model_type that plain transformers cannot resolve on its own."""
+class GembyRuntime:
+    """Loaded model + tokenizer with a generate()/stream() interface."""
+
+    def __init__(self, model, tokenizer, device: str, prompt_fn=None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.prompt_fn = prompt_fn
+
+    def _build_inputs(self, messages: list[dict]):
+        tok = self.tokenizer
+        text = None
+        if self.prompt_fn is not None:
+            text = self.prompt_fn(messages)
+        elif getattr(tok, "chat_template", None):
+            try:
+                text = tok.apply_chat_template(messages, tokenize=False,
+                                               add_generation_prompt=True)
+            except Exception:
+                text = None
+        if text is None:
+            text = "\n".join(f"{m.get('role','user')}: {m.get('content','')}"
+                             for m in messages) + "\nassistant:"
+        return tok(text, return_tensors="pt", add_special_tokens=False).to(self.device)
+
+    def _gen_kwargs(self, max_new_tokens, temperature, top_p):
+        do_sample = temperature is not None and temperature > 0
+        kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+        )
+        if do_sample:
+            kwargs.update(temperature=temperature, top_p=top_p)
+        return kwargs
+
+    def generate(self, messages, max_new_tokens=512, temperature=0.7, top_p=0.95) -> str:
+        import torch
+
+        inputs = self._build_inputs(messages)
+        with torch.no_grad():
+            out = self.model.generate(**inputs,
+                                      **self._gen_kwargs(max_new_tokens, temperature, top_p))
+        new_tokens = out[0][inputs["input_ids"].shape[-1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    def stream(self, messages, max_new_tokens=512, temperature=0.7, top_p=0.95):
+        import torch
+        from transformers import TextIteratorStreamer
+
+        inputs = self._build_inputs(messages)
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True,
+                                        skip_special_tokens=True)
+        kwargs = dict(**inputs, **self._gen_kwargs(max_new_tokens, temperature, top_p),
+                      streamer=streamer)
+        thread = threading.Thread(target=self.model.generate, kwargs=kwargs)
+        thread.start()
+        for chunk in streamer:
+            if chunk:
+                yield chunk
+        thread.join()
+
+
+def load_runtime(model_id: str, dtype: str = "auto", device: str | None = None,
+                 trust_remote_code: bool = True) -> GembyRuntime:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig
     except ImportError as exc:
-        raise SystemExit(
-            f"[gemby] missing dependency '{exc.name}'. Install the runtime with:\n"
-            "        pip install -r /workspace/gemby/requirements.txt"
-        ) from exc
+        _need_deps(exc)
 
-    token = _hf_token()
     if not device:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = _resolve_dtype(dtype, device)
-
-    print(f"[gemby] loading tokenizer: {model_id}", file=sys.stderr)
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id, token=token, trust_remote_code=trust_remote_code
-        )
-    except Exception as exc:  # tokenizer may lack tokenizer_config.json
-        print(f"[gemby] tokenizer load failed ({exc}); retrying manually", file=sys.stderr)
-        from transformers import PreTrainedTokenizerFast
-
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(Path(_hub_cache_dir(model_id)) / "tokenizer.json")
-        )
-
-    print(f"[gemby] loading model: {model_id} ({dtype} on {device})", file=sys.stderr)
-    load_kwargs = dict(
-        token=token,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        device_map=device if device == "cpu" else "auto",
-    )
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-    except ValueError as exc:
-        msg = str(exc)
-        if "model type" not in msg and "unrecognized" not in msg.lower():
-            raise
-        if not base_model:
-            raise SystemExit(
-                f"[gemby] '{model_id}' declares a custom model type that transformers\n"
-                f"cannot build: {msg}\n"
-                "Re-run with --base-model <hf-repo-id> (a decoder-only architecture\n"
-                "with matching weights, e.g. a Qwen2/Llama variant) so Gemby can\n"
-                "instantiate the config and load the state dict. See README notes."
-            ) from exc
-        print(f"[gemby] custom model type -> using --base-model {base_model}", file=sys.stderr)
-        from transformers import AutoConfig
-
-        config = AutoConfig.from_pretrained(base_model, token=token)
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype)
-        state = _load_state_dict(model_id)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(
-                f"[gemby] warning: {len(missing)} missing / {len(unexpected)} "
-                "unexpected weight keys",
-                file=sys.stderr,
-            )
-
-    model.eval()
-    return GembyRuntime(model, tokenizer, device)
-
-
-def _hub_cache_dir(model_id: str) -> Path:
-    from huggingface_hub import snapshot_download
-
-    return Path(snapshot_download(model_id, token=_hf_token()))
-
-
-def _load_state_dict(model_id: str):
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
-
-    path = Path(snapshot_download(model_id, token=_hf_token()))
-    weights = path / "model.safetensors"
-    if not weights.exists():
-        weights = path / "downloaded_existing_model" / "model.safetensors"
-    return load_file(str(weights))
-
-
-def pull_model(model_id: str, base_model: str | None = None, dtype: str = "auto") -> None:
-    if not _hf_token():
+    token = _hf_token()
+    if not token:
         raise SystemExit(
             "[gemby] HF_TOKEN is not set. This model is gated: accept its license at\n"
             f"        https://huggingface.co/{model_id}\n"
-            "        then run `huggingface-cli login` or `export HF_TOKEN=hf_...`."
+            "        then add a Codespaces secret named HF_TOKEN, or put it in .env."
         )
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise SystemExit(
-            f"[gemby] missing dependency '{exc.name}'. Install the runtime with:\n"
-            "        pip install -r /workspace/gemby/requirements.txt"
-        ) from exc
-    print(f"[gemby] downloading {model_id} ...", file=sys.stderr)
-    path = snapshot_download(
-        model_id,
-        token=_hf_token(),
-        ignore_patterns=["*.jsonl"],  # skip the multi-GB training datasets
-    )
-    print(f"[gemby] cached at: {path}")
+        hf_cfg = AutoConfig.from_pretrained(model_id, token=token,
+                                            trust_remote_code=trust_remote_code)
+        model_type = getattr(hf_cfg, "model_type", "")
+    except Exception:
+        model_type = ""
+
+    print(f"[gemby] model_type={model_type or '?'} -> device={device} dtype={dtype}",
+          file=sys.stderr)
+    if model_type == "gemby":
+        return _load_gemby(model_id, dtype, device)
+    return _load_generic(model_id, dtype, device, trust_remote_code)
+
+
+def pull_model(model_id: str) -> None:
+    local_dir = _download_assets(model_id)
+    total = sum((local_dir / f).stat().st_size for f in MODEL_FILES if (local_dir / f).exists())
+    print(f"[gemby] cached at: {local_dir}  ({total / 1e9:.1f} GB)")
 
 
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_pull(args) -> int:
-    pull_model(args.model, args.base_model, args.dtype)
+    pull_model(args.model)
     return 0
 
 
 def cmd_chat(args) -> int:
-    runtime = load_runtime(args.model, args.base_model, args.dtype, args.device)
+    runtime = load_runtime(args.model, args.dtype, args.device)
     print("Gemby ready. Type 'exit' or Ctrl-D to quit.")
-    history: list[dict] = []
+    history = []
     if args.system:
         history.append({"role": "system", "content": args.system})
     while True:
@@ -377,13 +446,10 @@ def cmd_serve(args) -> int:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     if not key_list():
-        print(
-            "[gemby] no API key exists yet. Run `gemby key new` first.",
-            file=sys.stderr,
-        )
+        print("[gemby] no API key exists yet. Run `gemby key new` first.", file=sys.stderr)
         return 1
 
-    runtime = load_runtime(args.model, args.base_model, args.dtype, args.device)
+    runtime = load_runtime(args.model, args.dtype, args.device)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "Gemby/1.0"
@@ -398,11 +464,9 @@ def cmd_serve(args) -> int:
 
         def _authorized(self) -> bool:
             header = self.headers.get("Authorization", "")
-            if not header.startswith("Bearer "):
-                return False
-            return key_verify(header[len("Bearer "):].strip())
+            return header.startswith("Bearer ") and key_verify(header[len("Bearer "):].strip())
 
-        def log_message(self, fmt, *a):  # quieter logs
+        def log_message(self, fmt, *a):
             sys.stderr.write("[gemby] " + fmt % a + "\n")
 
         def do_GET(self):
@@ -436,12 +500,9 @@ def cmd_serve(args) -> int:
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 for chunk in runtime.stream(messages, max_tokens, temperature, top_p):
-                    data = {
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": args.model,
-                        "choices": [{"index": 0, "delta": {"content": chunk}}],
-                    }
+                    data = {"object": "chat.completion.chunk", "created": created,
+                            "model": args.model,
+                            "choices": [{"index": 0, "delta": {"content": chunk}}]}
                     self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -454,17 +515,15 @@ def cmd_serve(args) -> int:
                 "object": "chat.completion",
                 "created": created,
                 "model": args.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }],
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": text},
+                             "finish_reason": "stop"}],
                 "usage": {},
             })
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[gemby] serving {args.model} at http://{args.host}:{args.port}/v1 "
-          f"(Bearer auth required)")
+          "(Bearer auth required)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -474,27 +533,24 @@ def cmd_serve(args) -> int:
 
 def cmd_key(args) -> int:
     if args.key_command == "new":
-        raw = key_new(args.name)
-        print(raw)
+        print(key_new(args.name))
         print("\nStore it now - it is only shown once.", file=sys.stderr)
     elif args.key_command == "list":
         entries = key_list()
         if not entries:
             print("(no keys)")
             return 0
-        print(f"{'PREFIX':<16}{'NAME':<16}{'CREATED':<26}LAST USED")
+        print(f"{'PREFIX':<16}{'NAME':<16}{'CREATED':<28}LAST USED")
         for e in entries:
-            print(f"{e['prefix']:<16}{e['name']:<16}{e['created']:<26}{e.get('last_used') or '-'}")
+            print(f"{e['prefix']:<16}{e['name']:<16}{e['created']:<28}{e.get('last_used') or '-'}")
     elif args.key_command == "revoke":
-        n = key_revoke(args.key)
-        print(f"revoked {n} key(s)")
+        print(f"revoked {key_revoke(args.key)} key(s)")
     return 0
 
 
 def cmd_info(args) -> int:
     token_state = "set" if _hf_token() else "NOT set (gated model cannot be downloaded)"
     print(f"model id      : {args.model}")
-    print(f"base model    : {args.base_model or '-'}")
     print(f"HF token      : {token_state}")
     print(f"state dir     : {GEMBY_HOME}")
     print(f"keys stored   : {len(key_list())} ({KEYS_FILE})")
@@ -514,13 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gemby", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=os.environ.get("GEMBY_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--base-model", default=os.environ.get("GEMBY_BASE_MODEL"))
     parser.add_argument("--dtype", default="auto",
                         choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device", default=None, choices=["cpu", "cuda"])
 
     sub = parser.add_subparsers(dest="command", required=True)
-
     sub.add_parser("pull", help="download/cache the model").set_defaults(func=cmd_pull)
 
     chat = sub.add_parser("chat", help="interactive chat")
@@ -549,9 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv()
     args = build_parser().parse_args(argv)
-    if getattr(args, "device", None) is None:
-        args.device = None
     return args.func(args)
 
 
