@@ -1,0 +1,40 @@
+{
+  "name": "High Performance Cloud Computer (Linux)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "VARIANT": "ubuntu-24.04"
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/ssh:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "rust-lang.rust-analyzer",
+        "ms-python.python",
+        "golang.Go"
+      ]
+    }
+  },
+  "remoteUser": "codespace",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential git && sudo sysctl -w vm.swappiness=10 && sudo sysctl -w net.core.rmem_max=26214400 && sudo sysctl -w net.core.wmem_max=26214400",
+  "mounts": [
+    "source=/tmp/cache,target=/tmp/cache,type=bind,consistency=cached"
+  ],
+  "containerEnv": {
+    "MAKEFLAGS": "-j$(nproc)",
+    "CCACHE_DIR": "/tmp/cache/.ccache"
+  },
+  "forwardPorts": [8080, 3000, 5000],
+  "runArgs": [
+    "--init",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt", "seccomp=unconfined",
+    "--shm-size=2g"
+  ]
+}

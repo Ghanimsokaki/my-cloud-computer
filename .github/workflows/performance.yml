@@ -1,0 +1,37 @@
+name: Performance Cloud Environment
+
+on:
+  push:
+    branches: [ main, arena/e9fb3f1f-my-cloud-computer ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    name: Build Linux Performance Environment
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+      options: --shm-size=2g --cap-add=SYS_PTRACE
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Performance Build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build ccache
+          export MAKEFLAGS="-j$(nproc)"
+          export CCACHE_DIR="/tmp/cache/.ccache"
+          mkdir -p $CCACHE_DIR
+          ccache --max-size=5G
+          echo "Performance environment ready with $MAKEFLAGS"
+
+  build-windows:
+    name: Build Windows Performance Environment
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Performance Build (Windows)
+        run: |
+          $env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
+          Write-Output "Performance environment ready with $env:MAKEFLAGS"
+          # Add Windows specific performance tuning here (e.g. choco install)
