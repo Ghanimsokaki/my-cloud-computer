@@ -22,7 +22,7 @@
     }
   },
   "remoteUser": "codespace",
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential git && sudo sysctl -w vm.swappiness=10 && sudo sysctl -w net.core.rmem_max=26214400 && sudo sysctl -w net.core.wmem_max=26214400",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential git",
   "mounts": [
     "source=/tmp/cache,target=/tmp/cache,type=bind,consistency=cached"
   ],

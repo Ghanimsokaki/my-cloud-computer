@@ -25,10 +25,10 @@ RUN mkdir -p $CCACHE_DIR && \
     ccache --max-size=5G && \
     chmod 777 $CCACHE_DIR
 
-# Set high performance limits
-RUN echo 'vm.swappiness=10' >> /etc/sysctl.conf && \
-    echo 'net.core.rmem_max=26214400' >> /etc/sysctl.conf && \
-    echo 'net.core.wmem_max=26214400' >> /etc/sysctl.conf
+# Set high performance limits (Note: sysctl may be ignored in restricted containers; runArgs --shm-size handles memory)
+# RUN echo 'vm.swappiness=10' >> /etc/sysctl.conf && \
+#     echo 'net.core.rmem_max=26214400' >> /etc/sysctl.conf && \
+#     echo 'net.core.wmem_max=26214400' >> /etc/sysctl.conf
 
 # User setup
 USER codespace

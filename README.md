@@ -10,9 +10,8 @@ This repository is configured for high-performance development in **GitHub Codes
 4. The environment will provision with:
    - **Parallel Compilation**: `MAKEFLAGS=-j$(nproc)`
    - **CCache**: Enabled for 5GB cache to speed up rebuilds.
-   - **Network Optimization**: High `rmem_max` / `wmem_max` limits.
-   - **Memory**: 2GB Shared Memory (`/dev/shm`).
-   - **Sysctl**: Swappiness set to 10 (low swap usage).
+- **Memory**: 2GB Shared Memory (`/dev/shm`).
+- **Network/Kernel**: Optimized via container runArgs (no host sysctl required).
 
 ## 🪟 Windows Configuration
 
@@ -26,7 +25,7 @@ For Windows target builds or Windows-based runners:
 - **Parallel Build Flags**: Automatically uses all available CPU cores (`-j$(nproc)`).
 - **Optimized Dockerfile**: Minimal layers, non-interactive installs, and cleaned apt cache.
 - **Shared Memory**: 2GB `/dev/shm` for fast IPC and temporary files.
-- **Sysctl Tuning**: Optimized for network and memory swapping.
+- **Container Optimization**: Uses `--init`, `--cap-add`, and `--shm-size` via runArgs (safe for Codespaces).
 
 ## 🛠️ Development Tools
 
