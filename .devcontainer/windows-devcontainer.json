@@ -1,0 +1,28 @@
+# Windows Performance Configuration (WSL2 / Windows Container Target)
+# This configuration is for building Windows targets or running in Windows-based Codespaces (if available via GitHub Actions runners)
+
+{
+  "name": "High Performance Cloud Computer (Windows Target)",
+  "image": "mcr.microsoft.com/windows/servercore:ltsc2022",
+  "remoteUser": "ContainerAdministrator",
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools"
+      ]
+    }
+  },
+  "postCreateCommand": [
+    "powershell",
+    "-Command",
+    "Set-ExecutionPolicy Bypass -Scope Process -Force; Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force; Install-Package -Name chocolatey -Force; choco install git cmake ninja -y; $env:CCACHE_DIR='C:\\tmp\\ccache'; $env:MAKEFLAGS='-j%NUMBER_OF_PROCESSORS%'"
+  ],
+  "runArgs": [
+    "--isolation", "process",
+    "--memory", "8g",
+    "--cpu-shares", "1024"
+  ]
+}
